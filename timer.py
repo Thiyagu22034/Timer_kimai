@@ -16,11 +16,13 @@ CONFIG_FILE = "config.json"
 SCREENSHOT_DIR = "screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
-PAGE_WAIT_SECONDS = 5 * 60  # Fixed 5 minutes (300 seconds) per link
+PAGE_WAIT_SECONDS = 300  # Fixed 5 minutes (300 seconds) per link
 
+# --- Persistent Config Storage ---
 DEFAULT_CONFIG = {
     "links": ["https://autoupdater-thiyagu.streamlit.app/"],
     "interval_minutes": 120,  # Default: 2 hours (120 minutes)
+    "is_active": False  # Remembers if the bot was running before a restart
 }
 
 
@@ -53,7 +55,7 @@ def delete_screenshot(url):
             pass
 
 
-# --- Persistent Config Storage ---
+# --- Config Management ---
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         save_config(DEFAULT_CONFIG)
@@ -65,6 +67,8 @@ def load_config():
                 data["links"] = DEFAULT_CONFIG["links"]
             if "interval_minutes" not in data:
                 data["interval_minutes"] = DEFAULT_CONFIG["interval_minutes"]
+            if "is_active" not in data:
+                data["is_active"] = False
             return data
     except Exception:
         return DEFAULT_CONFIG.copy()
@@ -192,13 +196,21 @@ def background_loop(worker_state):
 # --- Singleton State Across Sessions ---
 @st.cache_resource
 def get_worker_state():
+    # Read the config file on boot to see if it SHOULD be running
+    initial_config = load_config()
+    should_run = initial_config.get("is_active", False)
+
     state = {
-        "running": False,
+        "running": should_run,  # Automatically resume if it was active before the restart
         "last_run": "Not yet run",
-        "next_run": "Stopped",
+        "next_run": "Stopped" if not should_run else "Resuming after server restart...",
         "link_last_run": {},
-        "logs": []
+        "logs": [f"[{now_str()}] Server started/restarted."]
     }
+
+    if should_run:
+        state["logs"].insert(0, f"[{now_str()}] Auto-resumed background worker from saved config.")
+
     thread = threading.Thread(target=background_loop, args=(state,), daemon=True)
     thread.start()
     return state
@@ -217,52 +229,64 @@ st.title("🔄 Auto Link Opener, Scroller & Screenshot")
 if browser_status is not True:
     st.warning(f"Browser setup notice: {browser_status}")
 
-
 # 1. Live Status, Timestamps & Start/Stop Controls
-@st.fragment(run_every=3)
-def render_status_panel():
-    st.subheader("1. Runner Status & Schedule")
-    col_status, col_btn = st.columns([2.5, 1])
+st.subheader("1. Runner Status & Schedule")
+col_status, col_btn = st.columns([2.5, 1])
 
-    current_cfg = load_config()
-    req_mins = get_min_cycle_minutes(len(current_cfg["links"]))
-    is_valid_time = current_cfg["interval_minutes"] >= req_mins
+current_cfg = load_config()
+req_mins = get_min_cycle_minutes(len(current_cfg["links"]))
+is_valid_time = current_cfg["interval_minutes"] >= req_mins
 
-    with col_status:
-        if worker["running"]:
-            st.success(
-                f"🟢 **STATUS: ACTIVE** (Cycle: every **{current_cfg['interval_minutes']} min** | **5 min** wait/link)"
-            )
-        else:
-            st.error("🔴 **STATUS: INACTIVE / STOPPED**")
+# Move buttons outside the @st.fragment to prevent race conditions resetting them
+with col_btn:
+    if not worker["running"]:
+        if st.button("▶️ Activate", type="primary", use_container_width=True):
+            if not is_valid_time:
+                st.error(
+                    f"Cannot start! {len(current_cfg['links'])} link(s) take {len(current_cfg['links']) * 5} min. "
+                    f"Set cycle time to at least {req_mins} min first."
+                )
+            else:
+                worker["running"] = True
+                worker["next_run"] = "Initializing..."
+                worker["logs"].insert(0, f"[{now_str()}] Activated by user.")
 
-        st.markdown(
-            f"- **Last Cycle Started:** `{worker['last_run']}`\n"
-            f"- **Current / Next Action:** `{worker['next_run']}`"
-        )
+                # Save state to file so it remembers on reboot
+                current_cfg["is_active"] = True
+                save_config(current_cfg)
 
-    with col_btn:
-        if not worker["running"]:
-            if st.button("▶️ Activate", type="primary", width="stretch"):
-                if not is_valid_time:
-                    st.error(
-                        f"Cannot start! {len(current_cfg['links'])} link(s) take {len(current_cfg['links']) * 5} min. "
-                        f"Set cycle time to at least **{req_mins} min** first."
-                    )
-                else:
-                    worker["running"] = True
-                    worker["next_run"] = "Initializing..."
-                    worker["logs"].insert(0, f"[{now_str()}] Activated by user.")
-                    st.rerun()
-        else:
-            if st.button("⏹️ Stop", type="secondary", width="stretch"):
-                worker["running"] = False
-                worker["next_run"] = "Stopped"
-                worker["logs"].insert(0, f"[{now_str()}] Stopped by user.")
                 st.rerun()
+    else:
+        if st.button("⏹️ Stop", type="secondary", use_container_width=True):
+            worker["running"] = False
+            worker["next_run"] = "Stopped"
+            worker["logs"].insert(0, f"[{now_str()}] Stopped by user.")
+
+            # Save state to file so it stays stopped on reboot
+            current_cfg["is_active"] = False
+            save_config(current_cfg)
+
+            st.rerun()
 
 
-render_status_panel()
+# Only the text updates automatically now, ensuring stability
+@st.fragment(run_every=3)
+def render_status_text():
+    if worker["running"]:
+        st.success(
+            f"🟢 **STATUS: ACTIVE** (Cycle: every **{current_cfg['interval_minutes']} min** | **5 min** wait/link)"
+        )
+    else:
+        st.error("🔴 **STATUS: INACTIVE / STOPPED**")
+
+    st.markdown(
+        f"- **Last Cycle Started:** `{worker['last_run']}`\n"
+        f"- **Current / Next Action:** `{worker['next_run']}`"
+    )
+
+
+with col_status:
+    render_status_text()
 
 st.divider()
 
@@ -287,7 +311,7 @@ with st.form("interval_form"):
     with c_save:
         st.write("")
         st.write("")
-        save_time = st.form_submit_button("💾 Update Time", width="stretch")
+        save_time = st.form_submit_button("💾 Update Time", use_container_width=True)
 
     if save_time:
         new_minutes = int(time_value * 60 if time_unit == "Hours" else time_value)
@@ -300,7 +324,8 @@ with st.form("interval_form"):
             config["interval_minutes"] = new_minutes
             save_config(config)
             worker["logs"].insert(0, f"[{now_str()}] Cycle interval updated to every {new_minutes} min.")
-            st.success(f"✅ Schedule updated: runs every **{new_minutes} min** ({len(links) * 5} min process + {new_minutes - len(links) * 5} min rest).")
+            st.success(
+                f"✅ Schedule updated: runs every **{new_minutes} min** ({len(links) * 5} min process + {new_minutes - len(links) * 5} min rest).")
             st.rerun()
 
 st.divider()
@@ -342,7 +367,7 @@ def render_links_and_logs():
                 st.code(link, language=None)
                 st.caption(f"Last processed & captured: **{last_processed}**")
             with c2:
-                if st.button("🗑️ Remove", key=f"del_{idx}", width="stretch"):
+                if st.button("🗑️ Remove", key=f"del_{idx}", use_container_width=True):
                     removed_link = links.pop(idx)
                     delete_screenshot(removed_link)
                     config["links"] = links
@@ -352,7 +377,7 @@ def render_links_and_logs():
             shot_path = get_screenshot_path(link)
             if os.path.exists(shot_path):
                 with st.expander("📸 View Latest Screenshot", expanded=False):
-                    st.image(shot_path, caption=f"Captured at {last_processed}", width="stretch")
+                    st.image(shot_path, caption=f"Captured at {last_processed}", use_container_width=True)
                     with open(shot_path, "rb") as img_file:
                         st.download_button(
                             label="⬇️ Download Screenshot",
